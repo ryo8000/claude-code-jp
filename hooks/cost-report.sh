@@ -85,8 +85,8 @@ else
   MSG="⚡\$${DELTA_USD_FMT} 💰\$${TOTAL_USD_FMT} 📊${CONTEXT_PCT_FMT}%"
 fi
 
-NOTIF_BODY=$'Task completed!\n'"${MSG}"
-osascript -e "display notification \"$NOTIF_BODY\" with title \"Claude Code\"" >/dev/null 2>&1
+NOTIF_BODY=$'タスクが完了しました。\n'"${MSG}"
+osascript -e "display notification \"$NOTIF_BODY\" with title \"Claude Code\"" >/dev/null 2>&1 &
 
 jq -n --arg m "$MSG" '{systemMessage:$m, suppressOutput:true}'
 exit 0
