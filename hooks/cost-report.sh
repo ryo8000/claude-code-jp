@@ -3,7 +3,7 @@ input=$(cat)
 TP=$(echo "$input" | jq -r '.transcript_path // empty')
 SID=$(echo "$input" | jq -r '.session_id')
 
-if [ -z "$TP" ] || [ ! -f "$TP" ]; then
+if [ -z "$TP" ] || [ ! -f "$TP" ] || [ -z "$SID" ]; then
   jq -n '{suppressOutput:true}'
   exit 0
 fi
@@ -62,6 +62,12 @@ COST_USD=$(jq -s -f "$HOOK_DIR/cost-report-cost.jq" --argjson rates "$MODEL_RATE
 CONTEXT_PCT=$(jq -s -f "$HOOK_DIR/cost-report-context.jq" --argjson windows "$CONTEXT_WINDOWS" "$TP")
 CONTEXT_PCT_FMT=$(awk -v p="$CONTEXT_PCT" 'BEGIN{printf "%.1f", p}')
 
+# jqの計算失敗などでCOST_USDが数値でない場合、状態ファイルを破損させずに終了する。
+if [ -z "$COST_USD" ] || ! [[ "$COST_USD" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+  jq -n '{suppressOutput:true}'
+  exit 0
+fi
+
 # 前回累計との差分 = 今回ターンの増分
 # （compactionで累積が減る場合に備え0未満は0に丸める）
 PREV=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
@@ -79,7 +85,7 @@ else
   MSG="⚡\$${DELTA_USD_FMT} 💰\$${TOTAL_USD_FMT} 📊${CONTEXT_PCT_FMT}%"
 fi
 
-NOTIF_BODY="Task completed!\n${MSG}"
+NOTIF_BODY=$'Task completed!\n'"${MSG}"
 osascript -e "display notification \"$NOTIF_BODY\" with title \"Claude Code\"" >/dev/null 2>&1
 
 jq -n --arg m "$MSG" '{systemMessage:$m, suppressOutput:true}'
