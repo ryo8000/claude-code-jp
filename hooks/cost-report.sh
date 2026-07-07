@@ -1,7 +1,14 @@
 #!/bin/bash
 input=$(cat)
-TP=$(echo "$input" | jq -r '.transcript_path')
+TP=$(echo "$input" | jq -r '.transcript_path // empty')
 SID=$(echo "$input" | jq -r '.session_id')
+
+if [ -z "$TP" ] || [ ! -f "$TP" ]; then
+  jq -n '{suppressOutput:true}'
+  exit 0
+fi
+
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---- 設定 ----
 SHOW_JPY=true  # false にするとドル表示のみ（為替レート更新が不要になる）
@@ -9,11 +16,12 @@ RATE=160       # 1ドルあたりの円。SHOW_JPY=true のときのみ使用。
 
 # モデル別の1Mトークンあたりドル単価。新モデル追加時はここに追記してください
 # (参照: platform.claude.com/docs/en/about-claude/pricing)
+# Sonnet 5 は2026-08-31まで導入価格($2/$10)が適用され、2026-09-01以降は$3/$15になる。
 MODEL_RATES='
 {
   "claude-fable-5":   {"in": 10.00, "out": 50.00},
   "claude-mythos-5":  {"in": 10.00, "out": 50.00},
-  "claude-sonnet-5":  {"in": 3.00, "out": 15.00},
+  "claude-sonnet-5":  {"in": 2.00, "out": 10.00},
   "claude-opus-4-8":  {"in": 5.00, "out": 25.00},
   "claude-haiku-4-5": {"in": 1.00, "out": 5.00}
 }
@@ -34,6 +42,8 @@ CONTEXT_WINDOWS='
 STATE_DIR="$HOME/.claude/cost-state"
 mkdir -p "$STATE_DIR"
 STATE_FILE="$STATE_DIR/$SID.usd"
+# 30日以上更新のない古いセッションの状態ファイルを掃除する。
+find "$STATE_DIR" -name '*.usd' -mtime +30 -delete 2>/dev/null
 
 # サブエージェント(Task tool)の呼び出しは、メインと同じ形式で
 # <transcript_pathから.jsonlを除いたパス>/subagents/agent-*.jsonl に
@@ -44,59 +54,12 @@ SUBAGENT_FILES=("$SUBAGENTS_DIR"/agent-*.jsonl)
 shopt -u nullglob
 ALL_FILES=("$TP" "${SUBAGENT_FILES[@]}")
 
-# 以下2つのjq処理で共有するフィルタ関数。
-# - rate()/window() は前方一致で照合するため、日付付きのモデルID
-#   （例: サブエージェントのトランスクリプトで使われる claude-haiku-4-5-20251001）も
-#   上記のエイリアスキーに解決できる。
-# - 同一のAPIレスポンスがcontent blockごとに複数のトランスクリプト行として
-#   記録されるため、集計前に message.id で重複排除する。
-# - キャッシュ書込の単価: 1時間キャッシュ=入力単価の2倍、5分キャッシュ=1.25倍、
-#   キャッシュ読込=0.1倍（Anthropicの標準的な料金倍率）。
-JQ_COMMON='
-  def rate($model):
-    ($rates | keys) as $ks
-    | ($ks | map(select(. as $k | $model | startswith($k))) | sort_by(length) | last) as $k
-    | if $k then $rates[$k] else {in: 3.00, out: 15.00} end;
-  def window($model):
-    ($windows | keys) as $ks
-    | ($ks | map(select(. as $k | $model | startswith($k))) | sort_by(length) | last) as $k
-    | if $k then $windows[$k] else 1000000 end;
-'
-
 # コストはメインのトランスクリプトと全サブエージェントのトランスクリプトを合算する。
-COST_USD=$(jq -s --argjson rates "$MODEL_RATES" --argjson windows "$CONTEXT_WINDOWS" "
-  $JQ_COMMON
-  [ .[] | select(.type == \"assistant\" and .message.usage != null) ]
-  | unique_by(.message.id)
-  | map(
-      (.message.model) as \$model
-      | rate(\$model) as \$r
-      | .message.usage as \$u
-      | (\$u.cache_creation.ephemeral_1h_input_tokens // 0) as \$write1h
-      | (\$u.cache_creation.ephemeral_5m_input_tokens // 0) as \$write5m
-      | ( (\$u.input_tokens // 0)            * \$r.in          / 1000000 )
-      + ( (\$u.output_tokens // 0)           * \$r.out         / 1000000 )
-      + ( \$write1h                          * (\$r.in * 2)    / 1000000 )
-      + ( \$write5m                          * (\$r.in * 1.25) / 1000000 )
-      + ( (\$u.cache_read_input_tokens // 0) * (\$r.in * 0.1)  / 1000000 )
-    )
-  | add // 0
-" "${ALL_FILES[@]}")
+COST_USD=$(jq -s -f "$HOOK_DIR/cost-report-cost.jq" --argjson rates "$MODEL_RATES" "${ALL_FILES[@]}")
 
 # コンテキスト使用率はメイン会話のみを対象とする
 # （サブエージェントはそれぞれ別のコンテキストウィンドウを持つため）。
-# 直近ターンのusageを基準に算出する。
-CONTEXT_PCT=$(jq -s --argjson rates "$MODEL_RATES" --argjson windows "$CONTEXT_WINDOWS" "
-  $JQ_COMMON
-  ([ .[] | select(.type == \"assistant\" and .message.usage != null) ] | last) as \$latest
-  | if \$latest == null then 0
-    else
-      \$latest.message.usage as \$u
-      | ((\$u.input_tokens // 0) + (\$u.cache_read_input_tokens // 0) + (\$u.cache_creation_input_tokens // 0)) as \$used
-      | window(\$latest.message.model) as \$win
-      | (\$used / \$win * 100)
-    end
-" "$TP")
+CONTEXT_PCT=$(jq -s -f "$HOOK_DIR/cost-report-context.jq" --argjson windows "$CONTEXT_WINDOWS" "$TP")
 CONTEXT_PCT_FMT=$(awk -v p="$CONTEXT_PCT" 'BEGIN{printf "%.1f", p}')
 
 # 前回累計との差分 = 今回ターンの増分
