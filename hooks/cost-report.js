@@ -134,22 +134,22 @@ function main() {
     }
   }
 
-  // サブエージェント(Task tool)の呼び出しは、メインと同じ形式で
-  // <transcript_pathから.jsonlを除いたパス>/subagents/agent-*.jsonl に
-  // 独自のトランスクリプトを書き込む。委譲した分のコストも含めるため合算する。
-  const subagentsDir = `${tp.replace(/\.jsonl$/, '')}/subagents`;
-  const subagentFiles = fs.existsSync(subagentsDir)
-    ? fs
-        .readdirSync(subagentsDir)
-        .filter((name) => name.startsWith('agent-') && name.endsWith('.jsonl'))
-        .map((name) => path.join(subagentsDir, name))
-    : [];
-
-  // トランスクリプトの不完全な行(競合書き込み等)で例外が出た場合も、
-  // 状態ファイルを破損させたりクラッシュしたりせず終了する。
+  // トランスクリプトの不完全な行やファイルシステムエラー(競合書き込み・権限エラー等)で
+  // 例外が出た場合も、状態ファイルを破損させたりクラッシュしたりせず終了する。
   let costUsd;
   let contextPctFmt;
   try {
+    // サブエージェント(Task tool)の呼び出しは、メインと同じ形式で
+    // <transcript_pathから.jsonlを除いたパス>/subagents/agent-*.jsonl に
+    // 独自のトランスクリプトを書き込む。委譲した分のコストも含めるため合算する。
+    const subagentsDir = `${tp.replace(/\.jsonl$/, '')}/subagents`;
+    const subagentFiles = fs.existsSync(subagentsDir)
+      ? fs
+          .readdirSync(subagentsDir)
+          .filter((name) => name.startsWith('agent-') && name.endsWith('.jsonl'))
+          .map((name) => path.join(subagentsDir, name))
+      : [];
+
     costUsd = calcCostUsd([tp, ...subagentFiles]);
     contextPctFmt = calcContextPct(tp).toFixed(1);
   } catch {
