@@ -38,12 +38,21 @@ function suppress() {
   process.exit(0);
 }
 
+// トランスクリプト書き込み中に読まれた場合など、末尾行が不完全なことがあるため、
+// 行単位でパース失敗を許容し、解析できた行だけを対象にする。
 function readJsonl(filePath) {
   return fs
     .readFileSync(filePath, 'utf8')
     .split('\n')
     .filter((line) => line.trim() !== '')
-    .map((line) => JSON.parse(line));
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry) => entry !== null);
 }
 
 // モデル名は前方一致で照合するため、日付付きのモデルID
@@ -105,40 +114,38 @@ function calcContextPct(transcriptPath) {
   return (used / win) * 100;
 }
 
+// 予期しない失敗（stdinのパース不正、ファイルシステムエラー等）が起きても、
+// クラッシュせず必ずsuppress()で安全に終了する。
 function main() {
-  const input = JSON.parse(fs.readFileSync(0, 'utf8'));
-  const tp = input.transcript_path;
-  const sid = input.session_id;
-
-  if (!tp || !fs.existsSync(tp) || !sid) {
-    suppress();
-    return;
-  }
-
-  const stateDir = path.join(os.homedir(), '.claude', 'cost-state');
-  fs.mkdirSync(stateDir, { recursive: true });
-  const stateFile = path.join(stateDir, `${sid}.usd`);
-
-  // 30日以上更新のない古いセッションの状態ファイルを掃除する。
-  // 他セッションの同時実行によるレース（ファイルが既に削除済み等）は無視して続行する。
-  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
-  for (const name of fs.readdirSync(stateDir)) {
-    if (!name.endsWith('.usd')) continue;
-    const filePath = path.join(stateDir, name);
-    try {
-      if (Date.now() - fs.statSync(filePath).mtimeMs > THIRTY_DAYS_MS) {
-        fs.unlinkSync(filePath);
-      }
-    } catch {
-      // no-op
-    }
-  }
-
-  // トランスクリプトの不完全な行やファイルシステムエラー(競合書き込み・権限エラー等)で
-  // 例外が出た場合も、状態ファイルを破損させたりクラッシュしたりせず終了する。
-  let costUsd;
-  let contextPctFmt;
   try {
+    const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+    const tp = input.transcript_path;
+    const sid = input.session_id;
+
+    if (!tp || !fs.existsSync(tp) || !sid) {
+      suppress();
+      return;
+    }
+
+    const stateDir = path.join(os.homedir(), '.claude', 'cost-state');
+    fs.mkdirSync(stateDir, { recursive: true });
+    const stateFile = path.join(stateDir, `${sid}.usd`);
+
+    // 30日以上更新のない古いセッションの状態ファイルを掃除する。
+    // 他セッションの同時実行によるレース（ファイルが既に削除済み等）は無視して続行する。
+    const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+    for (const name of fs.readdirSync(stateDir)) {
+      if (!name.endsWith('.usd')) continue;
+      const filePath = path.join(stateDir, name);
+      try {
+        if (Date.now() - fs.statSync(filePath).mtimeMs > THIRTY_DAYS_MS) {
+          fs.unlinkSync(filePath);
+        }
+      } catch {
+        // no-op
+      }
+    }
+
     // サブエージェント(Task tool)の呼び出しは、メインと同じ形式で
     // <transcript_pathから.jsonlを除いたパス>/subagents/agent-*.jsonl に
     // 独自のトランスクリプトを書き込む。委譲した分のコストも含めるため合算する。
@@ -150,44 +157,43 @@ function main() {
           .map((name) => path.join(subagentsDir, name))
       : [];
 
-    costUsd = calcCostUsd([tp, ...subagentFiles]);
-    contextPctFmt = calcContextPct(tp).toFixed(1);
+    const costUsd = calcCostUsd([tp, ...subagentFiles]);
+    const contextPctFmt = calcContextPct(tp).toFixed(1);
+
+    if (!Number.isFinite(costUsd)) {
+      suppress();
+      return;
+    }
+
+    // 前回累計との差分 = 今回ターンの増分
+    // （compactionで累積が減る場合に備え0未満は0に丸める）
+    let prev = 0;
+    try {
+      const parsed = parseFloat(fs.readFileSync(stateFile, 'utf8'));
+      if (Number.isFinite(parsed)) prev = parsed;
+    } catch {
+      // 状態ファイルが存在しない場合は0として扱う
+    }
+    fs.writeFileSync(stateFile, String(costUsd));
+    const deltaUsd = Math.max(costUsd - prev, 0);
+
+    // ⚡ = 今回分, 💰 = 累計コスト, 📊 = コンテキスト使用率
+    const msg = SHOW_JPY
+      ? `⚡¥${Math.round(deltaUsd * RATE)} 💰¥${Math.round(costUsd * RATE)} 📊${contextPctFmt}%`
+      : `⚡$${deltaUsd.toFixed(2)} 💰$${costUsd.toFixed(2)} 📊${contextPctFmt}%`;
+
+    const notifBody = `タスクが完了しました。\n${msg}`;
+    const osa = spawn('osascript', ['-e', `display notification "${notifBody}" with title "Claude Code"`], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    osa.on('error', () => {});
+    osa.unref();
+
+    process.stdout.write(JSON.stringify({ systemMessage: msg, suppressOutput: true }));
   } catch {
     suppress();
-    return;
   }
-
-  if (!Number.isFinite(costUsd)) {
-    suppress();
-    return;
-  }
-
-  // 前回累計との差分 = 今回ターンの増分
-  // （compactionで累積が減る場合に備え0未満は0に丸める）
-  let prev = 0;
-  try {
-    const parsed = parseFloat(fs.readFileSync(stateFile, 'utf8'));
-    if (Number.isFinite(parsed)) prev = parsed;
-  } catch {
-    // 状態ファイルが存在しない場合は0として扱う
-  }
-  fs.writeFileSync(stateFile, String(costUsd));
-  const deltaUsd = Math.max(costUsd - prev, 0);
-
-  // ⚡ = 今回分, 💰 = 累計コスト, 📊 = コンテキスト使用率
-  const msg = SHOW_JPY
-    ? `⚡¥${Math.round(deltaUsd * RATE)} 💰¥${Math.round(costUsd * RATE)} 📊${contextPctFmt}%`
-    : `⚡$${deltaUsd.toFixed(2)} 💰$${costUsd.toFixed(2)} 📊${contextPctFmt}%`;
-
-  const notifBody = `タスクが完了しました。\n${msg}`;
-  const osa = spawn('osascript', ['-e', `display notification "${notifBody}" with title "Claude Code"`], {
-    detached: true,
-    stdio: 'ignore',
-  });
-  osa.on('error', () => {});
-  osa.unref();
-
-  process.stdout.write(JSON.stringify({ systemMessage: msg, suppressOutput: true }));
 }
 
 main();
