@@ -1,0 +1,150 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+
+// ---- 設定 ----
+const SHOW_JPY = true; // false にするとドル表示のみ（為替レート更新が不要になる）
+const RATE = 160; // 1ドルあたりの円。SHOW_JPY=true のときのみ使用。為替レートは変動するので必要に応じて更新してください
+
+// モデル別の1Mトークンあたりドル単価。新モデル追加時はここに追記してください
+// (参照: platform.claude.com/docs/en/about-claude/pricing)
+// Sonnet 5 は2026-08-31まで導入価格($2/$10)が適用され、2026-09-01以降は$3/$15になる。
+const MODEL_RATES = {
+  'claude-fable-5': { in: 10.0, out: 50.0 },
+  'claude-mythos-5': { in: 10.0, out: 50.0 },
+  'claude-sonnet-5': { in: 2.0, out: 10.0 },
+  'claude-opus-4-8': { in: 5.0, out: 25.0 },
+  'claude-haiku-4-5': { in: 1.0, out: 5.0 },
+};
+const DEFAULT_RATE = { in: 3.0, out: 15.0 };
+
+// モデル別のコンテキストウィンドウ（トークン数）。未知のモデルは1Mにフォールバック。
+// (参照: platform.claude.com/docs/en/about-claude/models/overview)
+const CONTEXT_WINDOWS = {
+  'claude-fable-5': 1000000,
+  'claude-mythos-5': 1000000,
+  'claude-sonnet-5': 1000000,
+  'claude-opus-4-8': 1000000,
+  'claude-haiku-4-5': 200000,
+};
+const DEFAULT_WINDOW = 1000000;
+
+// トランスクリプト書き込み中に読まれた場合など、末尾行が不完全なことがあるため、
+// 行単位でパース失敗を許容し、解析できた行だけを対象にする。
+function readJsonl(filePath) {
+  return fs
+    .readFileSync(filePath, 'utf8')
+    .split('\n')
+    .filter((line) => line.trim() !== '')
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry) => entry !== null);
+}
+
+// モデル名は前方一致で照合するため、日付付きのモデルID
+// （例: サブエージェントのトランスクリプトで使われる claude-haiku-4-5-20251001）も
+// テーブルのエイリアスキーに解決できる。複数マッチ時は最長一致を優先する。
+function lookupByPrefix(table, model, fallback) {
+  const matched = Object.keys(table)
+    .filter((key) => model.startsWith(key))
+    .sort((a, b) => a.length - b.length)
+    .pop();
+  return matched ? table[matched] : fallback;
+}
+
+// コストはメインのトランスクリプトと全サブエージェントのトランスクリプトを合算する。
+// 同一のAPIレスポンスがcontent blockごとに複数のトランスクリプト行として記録されるため、
+// message.idで重複排除する。
+// キャッシュ書込の単価: 1時間キャッシュ=入力単価の2倍、5分キャッシュ=1.25倍、
+// キャッシュ読込=0.1倍（Anthropicの標準的な料金倍率）。
+function calcCostUsd(files) {
+  const seenIds = new Set();
+  let total = 0;
+
+  for (const file of files) {
+    for (const entry of readJsonl(file)) {
+      if (entry.type !== 'assistant' || !entry.message?.usage) continue;
+      if (seenIds.has(entry.message.id)) continue;
+      seenIds.add(entry.message.id);
+
+      const r = lookupByPrefix(MODEL_RATES, entry.message.model, DEFAULT_RATE);
+      const u = entry.message.usage;
+      const write1h = u.cache_creation?.ephemeral_1h_input_tokens ?? 0;
+      const write5m = u.cache_creation?.ephemeral_5m_input_tokens ?? 0;
+
+      total +=
+        ((u.input_tokens ?? 0) * r.in) / 1000000 +
+        ((u.output_tokens ?? 0) * r.out) / 1000000 +
+        (write1h * (r.in * 2)) / 1000000 +
+        (write5m * (r.in * 1.25)) / 1000000 +
+        ((u.cache_read_input_tokens ?? 0) * (r.in * 0.1)) / 1000000;
+    }
+  }
+
+  return total;
+}
+
+// コンテキスト使用率はメイン会話のみを対象とする
+// （サブエージェントはそれぞれ別のコンテキストウィンドウを持つため）。
+// 直近ターンのusageを基準に算出する。
+function calcContextPct(transcriptPath) {
+  const messages = readJsonl(transcriptPath).filter(
+    (e) => e.type === 'assistant' && e.message?.usage
+  );
+  const latest = messages[messages.length - 1];
+  if (!latest) return 0;
+
+  const u = latest.message.usage;
+  const used = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+  const win = lookupByPrefix(CONTEXT_WINDOWS, latest.message.model, DEFAULT_WINDOW);
+  return (used / win) * 100;
+}
+
+// 累計コスト・コンテキスト使用率は読み取り専用で算出する。
+// stop-notify.js（Stopフック）はターン単位の差分(⚡)を状態ファイルに保存しているため、
+// ここで同じ状態ファイルを更新すると、次のStop発火時の差分計算が狂ってしまう。
+function calcStatLine(transcriptPath) {
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) return '';
+
+  const subagentsDir = `${transcriptPath.replace(/\.jsonl$/, '')}/subagents`;
+  const subagentFiles = fs.existsSync(subagentsDir)
+    ? fs
+        .readdirSync(subagentsDir)
+        .filter((name) => name.startsWith('agent-') && name.endsWith('.jsonl'))
+        .map((name) => path.join(subagentsDir, name))
+    : [];
+
+  const costUsd = calcCostUsd([transcriptPath, ...subagentFiles]);
+  if (!Number.isFinite(costUsd)) return '';
+
+  const contextPctFmt = calcContextPct(transcriptPath).toFixed(1);
+  const costFmt = SHOW_JPY ? `¥${Math.round(costUsd * RATE)}` : `$${costUsd.toFixed(2)}`;
+  return `\n⚡- 💰${costFmt} 📊${contextPctFmt}%`;
+}
+
+function main() {
+  try {
+    const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+    const statLine = calcStatLine(input.transcript_path);
+
+    const body = `Claude Codeが入力待ちです${statLine}`;
+    const osa = spawn('osascript', ['-e', `display notification "${body}" with title "Claude Code"`], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    osa.on('error', () => {});
+    osa.unref();
+  } catch {
+    // Notificationフックはブロック不可のため、失敗しても握りつぶして終了する
+  }
+}
+
+main();
