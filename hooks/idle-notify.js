@@ -35,18 +35,22 @@ const DEFAULT_WINDOW = 1000000;
 // トランスクリプト書き込み中に読まれた場合など、末尾行が不完全なことがあるため、
 // 行単位でパース失敗を許容し、解析できた行だけを対象にする。
 function readJsonl(filePath) {
-  return fs
-    .readFileSync(filePath, 'utf8')
-    .split('\n')
-    .filter((line) => line.trim() !== '')
-    .map((line) => {
-      try {
-        return JSON.parse(line);
-      } catch {
-        return null;
-      }
-    })
-    .filter((entry) => entry !== null);
+  try {
+    return fs
+      .readFileSync(filePath, 'utf8')
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter((entry) => entry !== null);
+  } catch {
+    return [];
+  }
 }
 
 // モデル名は前方一致で照合するため、日付付きのモデルID
