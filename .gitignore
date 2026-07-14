@@ -10,4 +10,5 @@
 
 # 許可するディレクトリとその中身
 !/hooks/
-!/hooks/**
+/hooks/*
+!/hooks/*.js
