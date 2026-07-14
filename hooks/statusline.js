@@ -96,23 +96,37 @@ function calcCostUsd(files) {
 // ~/.claude/projects/ 配下の全プロジェクト・全セッションのトランスクリプトを対象に、
 // 当日分のコストを合算する。JSONLは追記専用のため、mtimeが今日より前のファイルは
 // 当日分のエントリを含みえないと判定して事前に除外する（フルスキャンを避けるため）。
+// readdirSync の recursive オプションは新しめのNode（18.17/20.1+）でのみ有効なため、
+// 古い環境でもクラッシュしないよう自前で再帰する。
 function findTodayCandidateFiles(now = new Date()) {
   const projectsDir = path.join(os.homedir(), '.claude', 'projects');
   if (!fs.existsSync(projectsDir)) return [];
 
   const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const results = [];
 
-  return fs
-    .readdirSync(projectsDir, { recursive: true, withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl'))
-    .map((entry) => path.join(entry.parentPath ?? entry.path, entry.name))
-    .filter((filePath) => {
-      try {
-        return fs.statSync(filePath).mtimeMs >= startOfToday;
-      } catch {
-        return false;
+  function traverse(dir) {
+    // 読めないディレクトリ/statできないファイルは無視して走査を続ける。
+    try {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          traverse(fullPath);
+        } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+          try {
+            if (fs.statSync(fullPath).mtimeMs >= startOfToday) results.push(fullPath);
+          } catch {
+            // no-op
+          }
+        }
       }
-    });
+    } catch {
+      // no-op
+    }
+  }
+
+  traverse(projectsDir);
+  return results;
 }
 
 function isSameLocalDay(a, b) {
