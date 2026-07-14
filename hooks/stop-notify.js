@@ -66,11 +66,26 @@ function lookupByPrefix(table, model, fallback) {
   return matched ? table[matched] : fallback;
 }
 
+// キャッシュ書込の単価: 1時間キャッシュ=入力単価の2倍、5分キャッシュ=1.25倍、
+// キャッシュ読込=0.1倍（Anthropicの標準的な料金倍率）。
+function costForEntry(entry) {
+  const r = lookupByPrefix(MODEL_RATES, entry.message.model, DEFAULT_RATE);
+  const u = entry.message.usage;
+  const write1h = u.cache_creation?.ephemeral_1h_input_tokens ?? 0;
+  const write5m = u.cache_creation?.ephemeral_5m_input_tokens ?? 0;
+
+  return (
+    ((u.input_tokens ?? 0) * r.in) / 1000000 +
+    ((u.output_tokens ?? 0) * r.out) / 1000000 +
+    (write1h * (r.in * 2)) / 1000000 +
+    (write5m * (r.in * 1.25)) / 1000000 +
+    ((u.cache_read_input_tokens ?? 0) * (r.in * 0.1)) / 1000000
+  );
+}
+
 // コストはメインのトランスクリプトと全サブエージェントのトランスクリプトを合算する。
 // 同一のAPIレスポンスがcontent blockごとに複数のトランスクリプト行として記録されるため、
 // message.idで重複排除する。
-// キャッシュ書込の単価: 1時間キャッシュ=入力単価の2倍、5分キャッシュ=1.25倍、
-// キャッシュ読込=0.1倍（Anthropicの標準的な料金倍率）。
 function calcCostUsd(files) {
   const seenIds = new Set();
   let total = 0;
@@ -80,18 +95,7 @@ function calcCostUsd(files) {
       if (entry.type !== 'assistant' || !entry.message?.usage) continue;
       if (seenIds.has(entry.message.id)) continue;
       seenIds.add(entry.message.id);
-
-      const r = lookupByPrefix(MODEL_RATES, entry.message.model, DEFAULT_RATE);
-      const u = entry.message.usage;
-      const write1h = u.cache_creation?.ephemeral_1h_input_tokens ?? 0;
-      const write5m = u.cache_creation?.ephemeral_5m_input_tokens ?? 0;
-
-      total +=
-        ((u.input_tokens ?? 0) * r.in) / 1000000 +
-        ((u.output_tokens ?? 0) * r.out) / 1000000 +
-        (write1h * (r.in * 2)) / 1000000 +
-        (write5m * (r.in * 1.25)) / 1000000 +
-        ((u.cache_read_input_tokens ?? 0) * (r.in * 0.1)) / 1000000;
+      total += costForEntry(entry);
     }
   }
 
@@ -177,7 +181,6 @@ function main() {
     fs.writeFileSync(stateFile, String(costUsd));
     const deltaUsd = Math.max(costUsd - prev, 0);
 
-    // ⚡ = 今回分, 💰 = 累計コスト, 📊 = コンテキスト使用率
     const msg = SHOW_JPY
       ? `⚡¥${Math.round(deltaUsd * RATE)} 💰¥${Math.round(costUsd * RATE)} 📊${contextPctFmt}%`
       : `⚡$${deltaUsd.toFixed(2)} 💰$${costUsd.toFixed(2)} 📊${contextPctFmt}%`;
