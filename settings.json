@@ -26,8 +26,7 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "~/.claude/hooks/statusline.js",
-    "refreshInterval": 5
+    "command": "~/.claude/hooks/statusline.js"
   },
   "tui": "default"
 }

@@ -4,7 +4,6 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('child_process');
 
 // ---- 設定 ----
 const SHOW_JPY = true; // false にするとドル表示のみ（為替レート更新が不要になる）
@@ -163,23 +162,6 @@ function formatUsd(amountUsd) {
   return SHOW_JPY ? `¥${Math.round(amountUsd * RATE)}` : `$${amountUsd.toFixed(2)}`;
 }
 
-// カレントディレクトリ名とgitブランチ名を「📁 dir (branch)」の形式で返す。
-// gitが使えない/リポジトリでない場合はブランチ部分を省略する。
-function detectRepoLabel(cwd) {
-  if (!cwd) return null;
-
-  let branch = '';
-  try {
-    const result = spawnSync('git', ['branch', '--show-current'], { cwd, encoding: 'utf8' });
-    if (result.status === 0) branch = result.stdout.trim();
-  } catch {
-    // gitが存在しない等は無視してディレクトリ名のみ表示する
-  }
-
-  const dirName = path.basename(cwd);
-  return branch ? `📁 ${dirName} (${branch})` : `📁 ${dirName}`;
-}
-
 // cost.total_lines_added / total_lines_removed はClaude Code側で集計済みの値をそのまま使う。
 // 古いバージョンではcostフィールド自体が無いため、その場合はセグメントを出さない。
 function formatLinesChanged(cost) {
@@ -236,7 +218,9 @@ function main() {
     }
 
     const mainMessages = filterAssistantMessages(tp);
-    const contextPctFmt = (input.context_window?.used_percentage ?? 0).toFixed(1);
+    // context_window は初回API呼び出し前・/compact直後・古いバージョンで欠けることがある。
+    // その場合は 0% と誤表示せず 📊- とする（🔥 と同じく一時的な「値なし」を明示）。
+    const contextPct = input.context_window?.used_percentage;
     const burnRateUsd = calcBurnRateUsdPerHour(mainMessages, costUsd);
     const burnFmt = burnRateUsd === null ? '-' : `${formatUsd(burnRateUsd)}/h`;
     const todayCostUsd = calcTodayCostUsd(findTodayCandidateFiles());
@@ -248,7 +232,7 @@ function main() {
 
     parts.push(`💰${formatUsd(costUsd)}`);
     parts.push(`📅${formatUsd(todayCostUsd)}`);
-    parts.push(`📊${contextPctFmt}%`);
+    parts.push(typeof contextPct === 'number' ? `📊${contextPct.toFixed(1)}%` : '📊-');
 
     const blockLabel = formatBlockLabel(input.rate_limits);
     if (blockLabel) parts.push(blockLabel);
@@ -257,10 +241,6 @@ function main() {
 
     const linesLabel = formatLinesChanged(input.cost);
     if (linesLabel) parts.push(linesLabel);
-
-    const cwd = input.workspace?.current_dir ?? input.cwd;
-    const repoLabel = detectRepoLabel(cwd);
-    if (repoLabel) parts.push(repoLabel);
 
     process.stdout.write(parts.join(' | '));
   } catch {
