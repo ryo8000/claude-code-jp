@@ -233,7 +233,7 @@ function main() {
 
     const mainMessages = filterAssistantMessages(tp);
     // context_window は初回API呼び出し前・/compact直後・古いバージョンで欠けることがある。
-    // その場合は 0% と誤表示せず 📊- とする（🔥 と同じく一時的な「値なし」を明示）。
+    // その場合は 0% と誤表示せず 🧠- とする（🔥 と同じく一時的な「値なし」を明示）。
     const contextPct = input.context_window?.used_percentage;
     const burnRateUsd = calcBurnRateUsdPerHour(mainMessages, costUsd);
     const burnFmt = burnRateUsd === null ? '-' : `${formatUsd(burnRateUsd)}/h`;
@@ -246,7 +246,7 @@ function main() {
 
     parts.push(`💰${formatUsd(costUsd)}`);
     parts.push(`📅${formatUsd(todayCostUsd)}`);
-    parts.push(typeof contextPct === 'number' ? `📊${contextPct.toFixed(1)}%` : '📊-');
+    parts.push(typeof contextPct === 'number' ? `🧠${contextPct.toFixed(1)}%` : '🧠-');
 
     const blockLabel = formatBlockLabel(input.rate_limits);
     if (blockLabel) parts.push(blockLabel);
