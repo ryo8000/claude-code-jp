@@ -182,8 +182,8 @@ function main() {
     const deltaUsd = Math.max(costUsd - prev, 0);
 
     const msg = SHOW_JPY
-      ? `⚡¥${Math.round(deltaUsd * RATE)} 💰¥${Math.round(costUsd * RATE)} 📊${contextPctFmt}%`
-      : `⚡$${deltaUsd.toFixed(2)} 💰$${costUsd.toFixed(2)} 📊${contextPctFmt}%`;
+      ? `⚡¥${Math.round(deltaUsd * RATE)} 💰¥${Math.round(costUsd * RATE)} 🧠${contextPctFmt}%`
+      : `⚡$${deltaUsd.toFixed(2)} 💰$${costUsd.toFixed(2)} 🧠${contextPctFmt}%`;
 
     const notifBody = `タスクが完了しました！\n${msg}`;
     const osa = spawn('osascript', ['-e', `display notification "${notifBody}" with title "Claude Code"`], {
